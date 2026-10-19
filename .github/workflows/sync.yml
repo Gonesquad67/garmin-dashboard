@@ -1,0 +1,50 @@
+name: 24/7 Garmin Sync voor Claude
+
+on:
+  schedule:
+    - cron: '0 * * * *' # Draait automatisch elk uur, 24/7!
+  workflow_dispatch:    # Hiermee kun je hem ook met 1 klik handmatig starten
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Installeer Python & Garmin
+        run: pip install garminconnect curl_cffi requests
+
+      - name: Haal Garmin data op en stuur naar Gist
+        env:
+          GARMIN_TOKENS: ${{ secrets.GARMIN_TOKENS }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          python - << 'EOF'
+          import os, json, tempfile, requests
+          from datetime import date
+          from pathlib import Path
+          from garminconnect import Garmin
+
+          tmp_dir = Path(tempfile.gettempdir()) / ".garminconnect"
+          tmp_dir.mkdir(exist_ok=True)
+          (tmp_dir / "garmin_tokens.json").write_text(os.environ["GARMIN_TOKENS"], encoding="utf-8")
+
+          client = Garmin()
+          client.login(str(tmp_dir))
+          today = date.today().isoformat()
+
+          data = {
+              "laatste_update": today,
+              "vandaag_stats": client.get_stats(today),
+              "hartslag": client.get_heart_rates(today),
+              "slaap": client.get_sleep_data(today),
+              "race_voorspellingen": client.get_race_predictions(),
+              "laatste_20_trainingen": client.get_activities(0, 20)
+          }
+
+          requests.patch(
+              f"https://api.github.com/gists/{os.environ['GIST_ID']}",
+              headers={"Authorization": f"token {os.environ['GIST_TOKEN']}"},
+              json={"files": {"garmin_data.json": {"content": json.dumps(data, indent=2, ensure_ascii=False)}}}
+          )
+          print("Succesvol bijgewerkt!")
+          EOF
