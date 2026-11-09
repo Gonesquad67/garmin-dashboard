@@ -1,25 +1,29 @@
-name: 24/7 Garmin Sync voor Claude
+name: 24/7 Garmin Coach Sync
 
 on:
   schedule:
-    - cron: '0 * * * *' # Draait automatisch elk uur, 24/7!
-  workflow_dispatch:    # Hiermee kun je hem ook met 1 klik handmatig starten
+    - cron: '*/30 * * * *' # Draait elke 30 minuten, 24/7 (ook als je laptop uit staat!)
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Installeer Python & Garmin
-        run: pip install garminconnect curl_cffi requests
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Haal Garmin data op en stuur naar Gist
+      - name: Installeer Python & Garmin
+        run: pip install garminconnect curl_cffi
+
+      - name: Haal de 5 Coach-cijfers op
         env:
           GARMIN_TOKENS: ${{ secrets.GARMIN_TOKENS }}
-          GIST_ID: ${{ secrets.GIST_ID }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: |
           python - << 'EOF'
-          import os, json, tempfile, requests
+          import os, json, tempfile
           from datetime import date
           from pathlib import Path
           from garminconnect import Garmin
@@ -32,19 +36,55 @@ jobs:
           client.login(str(tmp_dir))
           today = date.today().isoformat()
 
-          data = {
-              "laatste_update": today,
-              "vandaag_stats": client.get_stats(today),
-              "hartslag": client.get_heart_rates(today),
-              "slaap": client.get_sleep_data(today),
-              "race_voorspellingen": client.get_race_predictions(),
-              "laatste_20_trainingen": client.get_activities(0, 20)
+          stats = client.get_stats(today) or {}
+          sleep = client.get_sleep_data(today) or {}
+          hrv = client.get_hrv_data(today) or {}
+          activities = client.get_activities(0, 10) or []
+
+          # Haal exact de 5 cijfers eruit die jouw Claude Coach nodig heeft:
+          sleep_dto = sleep.get("dailySleepDTO", {})
+          sleep_sec = sleep_dto.get("sleepTimeSeconds") or 0
+          sleep_hours = round(sleep_sec / 3600, 2)
+          sleep_score = sleep_dto.get("sleepScores", {}).get("overall", {}).get("value")
+
+          hrv_summary = hrv.get("hrvSummary", {})
+          hrv_last_night = hrv_summary.get("lastNightAvg")
+          hrv_status = hrv_summary.get("status") # bijv. BALANCED / UNBALANCED
+
+          coach_data = {
+              "datum": today,
+              "1_slaapscore": sleep_score,
+              "2_uren_slaap": sleep_hours,
+              "3_rusthartslag": stats.get("restingHeartRate"),
+              "4_hrv_gemiddelde": hrv_last_night,
+              "4_hrv_status": hrv_status,
+              "5_body_battery_ochtend": stats.get("bodyBatteryHighestValue"),
+              "5_body_battery_nu": stats.get("bodyBatteryMostRecentValue"),
+              "stress_gemiddeld": stats.get("averageStressLevel"),
+              "stappen_vandaag": stats.get("totalSteps"),
+              "laatste_10_trainingen": [
+                  {
+                      "datum": a.get("startTimeLocal", "")[:10],
+                      "naam": a.get("activityName"),
+                      "sport": a.get("activityType", {}).get("typeKey"),
+                      "afstand_km": round((a.get("distance") or 0) / 1000, 2),
+                      "duur_min": round((a.get("duration") or 0) / 60, 1),
+                      "gem_hr": a.get("averageHR"),
+                      "training_effect_aeroob": a.get("aerobicTrainingEffect")
+                  } for a in activities
+              ]
           }
 
-          requests.patch(
-              f"https://api.github.com/gists/{os.environ['GIST_ID']}",
-              headers={"Authorization": f"token {os.environ['GIST_TOKEN']}"},
-              json={"files": {"garmin_data.json": {"content": json.dumps(data, indent=2, ensure_ascii=False)}}}
-          )
-          print("Succesvol bijgewerkt!")
+          # Sla het op als een simpele webpagina waar Claude altijd bij kan
+          Path("docs").mkdir(exist_ok=True)
+          with open("docs/index.html", "w", encoding="utf-8") as f:
+              f.write("<html><body><pre>" + json.dumps(coach_data, indent=2, ensure_ascii=False) + "</pre></body></html>")
           EOF
+
+      - name: Publiceer naar GitHub Pages
+        run: |
+          git config user.name "GarminBot"
+          git config user.email "bot@garmin.local"
+          git add docs/index.html
+          git diff --staged --quiet || git commit -m "Update coach data"
+          git push
